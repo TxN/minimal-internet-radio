@@ -25,6 +25,7 @@ namespace InternetRadio.Tests
                 Console.WriteLine("  live    <url> <seconds> <output.wav>");
                 Console.WriteLine("  play    <url> <seconds>            (Windows-only, live playback)");
                 Console.WriteLine("  wavplay <file.wav> [seconds]       (Windows-only, play a local WAV)");
+                Console.WriteLine("  fileplay <file.mp3> [seconds]      (Windows-only, stream a local MP3 through the pipeline)");
                 Console.WriteLine("  bench   <input.mp3> [iterations] [chunkBytes]");
                 return 2;
             }
@@ -41,6 +42,8 @@ namespace InternetRadio.Tests
                     return Play(args[1], int.Parse(args[2]));
                 case "wavplay":
                     return WavPlay(args[1], args.Length > 2 ? int.Parse(args[2]) : 0);
+                case "fileplay":
+                    return FilePlay(args[1], args.Length > 2 ? int.Parse(args[2]) : 0);
                 case "bench":
                     return Bench(args[1],
                         args.Length > 2 ? int.Parse(args[2]) : 5,
@@ -362,6 +365,123 @@ namespace InternetRadio.Tests
                 w.Write(dataLen);
                 w.Write(pcm16, 0, dataLen);
             }
+        }
+
+        /// <summary>
+        /// Streams a local MP3 file through the buffering + decoding pipeline and plays
+        /// it via WaveOutPlayer. Unlike <c>play</c>, the source is a file on disk rather
+        /// than a network station, so the streaming path is deterministic and offline.
+        /// Pass 0 (or omit) seconds to play the whole file and then drain the device.
+        /// </summary>
+        private static int FilePlay(string path, int seconds)
+        {
+            if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                Console.WriteLine("The 'fileplay' command is Windows-only.");
+                return 2;
+            }
+
+            if (!File.Exists(path))
+            {
+                Console.WriteLine("File not found: " + path);
+                return 2;
+            }
+
+            long fileLen = new FileInfo(path).Length;
+            int prebufferBytes = (int)Math.Min(128 * 1024L, Math.Max(1L, fileLen));
+
+            var stream = new FileStreamPlayer(path, ringCapacityBytes: 1024 * 1024, prebufferBytes: prebufferBytes);
+            var player = new WaveOutPlayer();
+            bool opened = false;
+            long firstFrameAt = 0;
+
+            stream.PcmDecoded += frame =>
+            {
+                if (!opened)
+                {
+                    player.Open(frame.SampleRate, frame.Channels);
+                    opened = true;
+                }
+                if (stream.Frames == 1)
+                    firstFrameAt = Environment.TickCount64;
+                player.Write(frame.Samples, 0, frame.Samples.Length);
+            };
+            stream.StateChanged += s => Console.WriteLine("STATE: " + s);
+            stream.Error += e => Console.WriteLine("ERROR: " + e.GetType().Name + ": " + e.Message);
+
+            Console.WriteLine("Streaming local file: " + path);
+            Console.WriteLine("  source   : " + fileLen + " bytes, prebuffer " + (prebufferBytes / 1024) + " KB, ring 1 MB");
+            Console.WriteLine("  sec | frames | read KB/s | buff KB | out queue | min queue");
+
+            stream.Start();
+
+            long prevBytes = 0;
+            int secIdx = 0;
+            long nextReport = Environment.TickCount64 + 1000;
+
+            if (seconds > 0)
+            {
+                for (int i = 1; i <= seconds; i++)
+                {
+                    Thread.Sleep(1000);
+                    secIdx = i;
+                    ReportFileStream(secIdx, stream, player, ref prevBytes);
+                }
+                stream.Stop();
+                player.Dispose();
+            }
+            else
+            {
+                // Play the whole file: wait for the reader+decoder to finish, then let
+                // the remaining queued audio (~up to 2.4 s) drain from the device.
+                while (!stream.IsDone)
+                {
+                    Thread.Sleep(250);
+                    long now = Environment.TickCount64;
+                    if (now >= nextReport)
+                    {
+                        secIdx++;
+                        nextReport = now + 1000;
+                        ReportFileStream(secIdx, stream, player, ref prevBytes);
+                    }
+                }
+
+                while (player.InFlightCount > 0)
+                {
+                    Thread.Sleep(500);
+                    long now = Environment.TickCount64;
+                    if (now >= nextReport)
+                    {
+                        secIdx++;
+                        nextReport = now + 1000;
+                        ReportFileStream(secIdx, stream, player, ref prevBytes);
+                    }
+                }
+
+                stream.Stop();
+                player.Dispose();
+            }
+
+            double playedSec = opened ? (Environment.TickCount64 - firstFrameAt) / 1000.0 : 0;
+            Console.WriteLine("Done. Decoded " + stream.Frames + " frames; played " + playedSec.ToString("0.0") +
+                              " s; WaveOut queue min " + player.MinInFlight + "/" + WaveOutPlayer.BufferCount +
+                              (opened && player.MinInFlight <= 1 ? " -> UNDERUN(S) detected" : "") + ".");
+            return 0;
+        }
+
+        private static void ReportFileStream(int sec, FileStreamPlayer stream, WaveOutPlayer player, ref long prevBytes)
+        {
+            long total = stream.BytesRead;
+            double kbps = (total - prevBytes) / 1024.0;
+            prevBytes = total;
+
+            Console.WriteLine(
+                "  " + sec.ToString().PadLeft(3) + " | " +
+                stream.Frames.ToString().PadLeft(6) + " | " +
+                kbps.ToString("0.0").PadLeft(9) + " | " +
+                (stream.BufferedBytes / 1024).ToString().PadLeft(7) + " | " +
+                player.InFlightCount.ToString().PadLeft(9) + " | " +
+                player.MinInFlight.ToString().PadLeft(9));
         }
 
         // ---------------------------------------------------------------------

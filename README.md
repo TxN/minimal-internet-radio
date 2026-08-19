@@ -105,6 +105,9 @@ dotnet run --project tests\InternetRadio.Tests -c Release -- play http://host:80
 
 # проиграть локальный WAV тем же плеером (изоляция уровня воспроизведения):
 dotnet run --project tests\InternetRadio.Tests -c Release -- wavplay file.wav 30
+
+# проиграть локальный MP3 через буферизацию + декодер (стриминг с диска, без сети):
+dotnet run --project tests\InternetRadio.Tests -c Release -- fileplay in.mp3 30
 ```
 
 ## Проверка на слух (Windows)
@@ -123,6 +126,11 @@ dotnet run --project tests\InternetRadio.Tests -c Release -- play http://195.91.
 минимальную — её падение к 0 означает underrun). Пополнение очереди идёт по событию
 `CALLBACK_EVENT`, а не опросом `Thread.Sleep(1)`; PCM агрегируется в блоки ~100 мс,
 чтобы драйвер звука не «спотыкался» на границах мелких блоков.
+
+`fileplay <file.mp3> [seconds]` — то же проигрывание, но источником служит локальный
+файл: читается с диска порциями и прогоняется через кольцевой буфер, пребуфер и
+декодер (без сети и ICY-метаданных). С `seconds = 0` (или без аргумента) файл
+проигрывается целиком, после чего очередь звука дренируется.
 
 Плеер намеренно вынесен в тестовый проект (Windows-only): сама библиотека
 `InternetRadio` остаётся кроссплатформенной и не содержит Windows-зависимостей.

@@ -6,7 +6,11 @@ namespace InternetRadio
     /// </summary>
     public readonly struct PcmFrame
     {
-        /// <summary>Interleaved signed 16-bit samples.</summary>
+        /// <summary>
+        /// Interleaved signed 16-bit samples. The array is reused between frames for
+        /// zero-GC streaming: copy it during the <c>PcmDecoded</c> handler if you need
+        /// to keep it past the next decoded frame.
+        /// </summary>
         public readonly short[] Samples;
 
         /// <summary>Sample rate in Hz (e.g. 44100).</summary>

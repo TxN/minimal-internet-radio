@@ -50,6 +50,16 @@ namespace InternetRadio
         private readonly short[] _pcm = new short[1152 * 2];
         private readonly FrameInfo _info = new FrameInfo();
 
+        // Reused scalefactor / stereo scratch, so the per-frame decode path allocates nothing.
+        private readonly byte[] _scfSize = new byte[4];
+        private readonly byte[] _scfInt = new byte[40];
+        private readonly int[] _maxBand = new int[3];
+
+        // Reused PCM output buffer. It is reallocated only when the frame size changes
+        // (mono -> stereo or sample layout change), which is at most once per stream.
+        private short[] _frame;
+        private int _frameLen;
+
         // Compressed input buffer.
         private byte[] _inBuf = new byte[16 * 1024];
         private int _inCount;
@@ -95,9 +105,13 @@ namespace InternetRadio
                 if (samples > 0)
                 {
                     int total = samples * _info.Channels;
-                    var frame = new short[total];
-                    Array.Copy(_pcm, frame, total);
-                    PcmDecoded?.Invoke(new PcmFrame(frame, _info.Hz, _info.Channels));
+                    if (_frame == null || _frameLen != total)
+                    {
+                        _frame = new short[total];
+                        _frameLen = total;
+                    }
+                    Array.Copy(_pcm, _frame, total);
+                    PcmDecoded?.Invoke(new PcmFrame(_frame, _info.Hz, _info.Channels));
                 }
 
                 int advance;
@@ -390,11 +404,11 @@ namespace InternetRadio
             scf[scfPos] = scf[scfPos + 1] = scf[scfPos + 2] = 0;
         }
 
-        private static void L3DecodeScalefactors(byte[] hdr, int hdrOff, byte[] istPos,
+        private void L3DecodeScalefactors(byte[] hdr, int hdrOff, byte[] istPos,
             Bs bs, L3GrInfo gr, float[] scf, int ch)
         {
-            byte[] scfSize = new byte[4];
-            byte[] iscf = new byte[40];
+            byte[] scfSize = _scfSize;
+            byte[] iscf = _scfInt;
             int scfShift = gr.ScalefacScale + 1;
             int scfsi = gr.Scfsi;
 
@@ -699,11 +713,11 @@ namespace InternetRadio
             }
         }
 
-        private static void L3IntensityStereo(float[] grbuf, byte[] istPos, L3GrInfo[] grInfo,
+        private void L3IntensityStereo(float[] grbuf, byte[] istPos, L3GrInfo[] grInfo,
             int grBase, byte[] hdr, int hdrOff)
         {
             L3GrInfo gr = grInfo[grBase];
-            int[] maxBand = new int[3];
+            int[] maxBand = _maxBand;
             int nSfb = gr.NLongSfb + gr.NShortSfb;
             int maxBlocks = gr.NShortSfb != 0 ? 3 : 1;
 

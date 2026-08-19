@@ -1,5 +1,4 @@
 using System;
-using System.Text;
 
 namespace InternetRadio
 {
@@ -20,8 +19,8 @@ namespace InternetRadio
         /// <summary>Receives clean audio chunks.</summary>
         public Action<byte[], int, int> OnAudio { get; set; }
 
-        /// <summary>Receives the raw metadata block text (unparsed).</summary>
-        public Action<string> OnMetadata { get; set; }
+        /// <summary>Receives a raw in-band metadata block (unparsed bytes).</summary>
+        public Action<byte[], int> OnMetadata { get; set; }
 
         public void Reset(int metaint)
         {
@@ -56,7 +55,7 @@ namespace InternetRadio
 
                     if (_metaBytesRemaining == 0)
                     {
-                        OnMetadata?.Invoke(DecodeMeta(_metaBuf, _metaLen));
+                        OnMetadata?.Invoke(_metaBuf, _metaLen);
                         _bytesToNextMeta = _metaint;
                     }
                 }
@@ -86,26 +85,5 @@ namespace InternetRadio
             }
         }
 
-        private static string DecodeMeta(byte[] buf, int len)
-        {
-            string s;
-            try
-            {
-                s = Encoding.UTF8.GetString(buf, 0, len);
-            }
-            catch
-            {
-                // Latin-1 fallback (Encoding.Latin1 is unavailable on netstandard2.0).
-                var chars = new char[len];
-                for (int i = 0; i < len; i++)
-                    chars[i] = (char)(buf[i] & 0xFF);
-                s = new string(chars);
-            }
-
-            int nz = s.IndexOf('\0');
-            if (nz >= 0)
-                s = s.Substring(0, nz);
-            return s;
-        }
     }
 }

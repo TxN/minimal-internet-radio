@@ -10,7 +10,10 @@ namespace InternetRadio
     /// </summary>
     public interface IAudioDecoder : IDisposable
     {
-        /// <summary>Raised for every decoded frame of PCM (interleaved 16-bit).</summary>
+        /// <summary>
+        /// Raised for every decoded frame of PCM (interleaved 16-bit). The frame's
+        /// sample array is reused: consume or copy it before the handler returns.
+        /// </summary>
         event Action<PcmFrame> PcmDecoded;
 
         /// <summary>Feed compressed audio bytes. May raise <see cref="PcmDecoded"/>.</summary>

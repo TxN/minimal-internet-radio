@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Text;
 using System.Threading;
 
 namespace InternetRadio
@@ -32,6 +33,11 @@ namespace InternetRadio
         private Thread _decoderThread;
         private RingBuffer _ring;
         private StationInfo _station;
+
+        // Caches the last in-band metadata block so the (rare) title message is only
+        // decoded/parsed when the raw block actually changes.
+        private byte[] _lastMeta;
+        private int _lastMetaLen;
 
         private volatile bool _stopRequested;
         private volatile bool _readerDone;
@@ -75,7 +81,11 @@ namespace InternetRadio
         /// <summary>Station metadata, populated after a successful connection.</summary>
         public StationInfo Station => _station;
 
-        /// <summary>Raised for each decoded chunk of interleaved 16-bit PCM.</summary>
+        /// <summary>
+        /// Raised for each decoded chunk of interleaved 16-bit PCM. The frame's sample
+        /// array is reused for zero-GC streaming; copy it during the handler if you need
+        /// to retain it past the next frame.
+        /// </summary>
         public event Action<PcmFrame> PcmDecoded;
 
         /// <summary>Raised when the in-stream 'StreamTitle' metadata changes.</summary>
@@ -117,6 +127,8 @@ namespace InternetRadio
                 _stopRequested = false;
                 _readerDone = false;
                 _failed = false;
+                _lastMeta = null;
+                _lastMetaLen = 0;
                 _ring = new RingBuffer(RingCapacityBytes);
 
                 _readerThread = new Thread(ReaderLoop) { IsBackground = true, Name = "InternetRadio.Reader" };
@@ -172,6 +184,9 @@ namespace InternetRadio
 
         private void ReaderLoop()
         {
+            // Allocated once per session and reused across reconnects: the steady-state
+            // socket read path must not produce per-chunk garbage.
+            byte[] buf = new byte[16 * 1024];
             try
             {
                 while (!_stopRequested)
@@ -185,7 +200,6 @@ namespace InternetRadio
                         if (State == PlaybackState.Connecting)
                             SetState(PlaybackState.Buffering);
 
-                        byte[] buf = new byte[16 * 1024];
                         while (!_stopRequested)
                         {
                             int n = client.Read(buf, 0, buf.Length);
@@ -261,9 +275,9 @@ namespace InternetRadio
                 }
             };
 
-            splitter.OnMetadata = raw =>
+            splitter.OnMetadata = (buf, len) =>
             {
-                string title = ParseStreamTitle(raw);
+                string title = ParseStreamTitle(buf, len);
                 if (title != null)
                     StreamTitleChanged?.Invoke(title);
             };
@@ -343,6 +357,25 @@ namespace InternetRadio
             Error?.Invoke(ex);
         }
 
+        private string ParseStreamTitle(byte[] meta, int len)
+        {
+            if (len <= 0)
+                return null;
+
+            // In-band metadata is re-sent every interval. Only decode/parse when the
+            // raw block actually changed, so the steady-state path stays allocation-free:
+            // a StreamTitle message is rare and irregular by nature.
+            if (_lastMeta != null && _lastMetaLen == len && BytesEqual(meta, _lastMeta, len))
+                return null;
+
+            var raw = new byte[len];
+            Array.Copy(meta, 0, raw, 0, len);
+            _lastMeta = raw;
+            _lastMetaLen = len;
+
+            return ParseStreamTitle(DecodeMeta(raw, len));
+        }
+
         private static string ParseStreamTitle(string raw)
         {
             if (string.IsNullOrEmpty(raw))
@@ -365,6 +398,38 @@ namespace InternetRadio
             }
 
             return null;
+        }
+
+        private static string DecodeMeta(byte[] buf, int len)
+        {
+            string s;
+            try
+            {
+                s = Encoding.UTF8.GetString(buf, 0, len);
+            }
+            catch
+            {
+                // Latin-1 fallback (Encoding.Latin1 is unavailable on netstandard2.0).
+                var chars = new char[len];
+                for (int i = 0; i < len; i++)
+                    chars[i] = (char)(buf[i] & 0xFF);
+                s = new string(chars);
+            }
+
+            int nz = s.IndexOf('\0');
+            if (nz >= 0)
+                s = s.Substring(0, nz);
+            return s;
+        }
+
+        private static bool BytesEqual(byte[] a, byte[] b, int count)
+        {
+            for (int i = 0; i < count; i++)
+            {
+                if (a[i] != b[i])
+                    return false;
+            }
+            return true;
         }
     }
 }

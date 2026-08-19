@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <RootNamespace>InternetRadio</RootNamespace>
+    <AssemblyName>InternetRadio</AssemblyName>
+    <Description>Compact dependency-free internet radio player: HTTP/ICY streaming, buffering and MP3 decoding to PCM.</Description>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <SignAssembly>false</SignAssembly>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="InternetRadio.Tests" />
+  </ItemGroup>
+
+</Project>

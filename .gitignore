@@ -1,0 +1,17 @@
+# .NET build output
+[Bb]in/
+[Oo]bj/
+
+# IDE
+.vs/
+*.user
+*.suo
+
+# Workspace-local files (not part of this project)
+/agat/
+/AGENTS.md
+
+# Generated validation artifacts (outputs of `decode` / `live` / `chunk`)
+*.pcm
+*.wav
+*.bin

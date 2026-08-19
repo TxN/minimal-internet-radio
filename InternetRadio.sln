@@ -1,0 +1,36 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{8336387A-746B-48BB-B0EC-663C54554EBE}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "InternetRadio", "src\InternetRadio\InternetRadio.csproj", "{8D7B6A45-4A4D-4EB4-A8BC-E59998A3AAF0}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{A4523F27-B258-4185-A8BC-287428FF9C15}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "InternetRadio.Tests", "tests\InternetRadio.Tests\InternetRadio.Tests.csproj", "{D30EE647-D0D0-47D8-AFCE-2933D6D290F4}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{8D7B6A45-4A4D-4EB4-A8BC-E59998A3AAF0}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{8D7B6A45-4A4D-4EB4-A8BC-E59998A3AAF0}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{8D7B6A45-4A4D-4EB4-A8BC-E59998A3AAF0}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{8D7B6A45-4A4D-4EB4-A8BC-E59998A3AAF0}.Release|Any CPU.Build.0 = Release|Any CPU
+		{D30EE647-D0D0-47D8-AFCE-2933D6D290F4}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D30EE647-D0D0-47D8-AFCE-2933D6D290F4}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D30EE647-D0D0-47D8-AFCE-2933D6D290F4}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D30EE647-D0D0-47D8-AFCE-2933D6D290F4}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{8D7B6A45-4A4D-4EB4-A8BC-E59998A3AAF0} = {8336387A-746B-48BB-B0EC-663C54554EBE}
+		{D30EE647-D0D0-47D8-AFCE-2933D6D290F4} = {A4523F27-B258-4185-A8BC-287428FF9C15}
+	EndGlobalSection
+EndGlobal

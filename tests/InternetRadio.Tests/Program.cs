@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -24,6 +25,7 @@ namespace InternetRadio.Tests
                 Console.WriteLine("  live    <url> <seconds> <output.wav>");
                 Console.WriteLine("  play    <url> <seconds>            (Windows-only, live playback)");
                 Console.WriteLine("  wavplay <file.wav> [seconds]       (Windows-only, play a local WAV)");
+                Console.WriteLine("  bench   <input.mp3> [iterations] [chunkBytes]");
                 return 2;
             }
 
@@ -39,6 +41,10 @@ namespace InternetRadio.Tests
                     return Play(args[1], int.Parse(args[2]));
                 case "wavplay":
                     return WavPlay(args[1], args.Length > 2 ? int.Parse(args[2]) : 0);
+                case "bench":
+                    return Bench(args[1],
+                        args.Length > 2 ? int.Parse(args[2]) : 5,
+                        args.Length > 3 ? int.Parse(args[3]) : 0);
                 default:
                     Console.WriteLine("unknown command: " + args[0]);
                     return 2;
@@ -356,6 +362,118 @@ namespace InternetRadio.Tests
                 w.Write(dataLen);
                 w.Write(pcm16, 0, dataLen);
             }
+        }
+
+        // ---------------------------------------------------------------------
+        // Decoder benchmark
+        // ---------------------------------------------------------------------
+
+        private static long _benchSamples;
+        private static int _benchHz;
+        private static int _benchCh;
+
+        /// <summary>
+        /// Benchmarks the MP3 decoder on a real file. The file is read once; it is then
+        /// decoded repeatedly (whole-file or in streaming-sized chunks) so timing covers
+        /// only the decoder, not I/O. Reports throughput, real-time factor and managed
+        /// allocations per pass.
+        /// </summary>
+        private static int Bench(string input, int iterations, int chunkBytes)
+        {
+            if (iterations <= 0) iterations = 5;
+
+            byte[] bytes = File.ReadAllBytes(input);
+            var decoder = new Mp3Decoder();
+
+            // The handler references only static fields, so the compiler caches the
+            // delegate: the benchmark itself does not allocate per decoded frame.
+            decoder.PcmDecoded += f =>
+            {
+                _benchSamples += f.Samples.Length;
+                _benchHz = f.SampleRate;
+                _benchCh = f.Channels;
+            };
+
+            // Warm-up: JIT and let the decoder's reusable buffers reach steady size.
+            _benchSamples = 0;
+            FeedBench(decoder, bytes, chunkBytes);
+            long samplesPerPass = _benchSamples;
+            int hz = _benchHz;
+            int ch = _benchCh;
+
+            if (samplesPerPass <= 0 || hz <= 0 || ch <= 0)
+            {
+                Console.WriteLine("No PCM decoded; is this a valid Layer III MP3?");
+                return 2;
+            }
+
+            double audioSeconds = samplesPerPass / (double)(hz * ch);
+            double inputMB = bytes.Length / (1024.0 * 1024.0);
+
+            var elapsedMs = new double[iterations];
+            var allocBytes = new long[iterations];
+
+            for (int i = 0; i < iterations; i++)
+            {
+                decoder.Reset();
+                _benchSamples = 0;
+                long allocBefore = GC.GetAllocatedBytesForCurrentThread();
+                var sw = Stopwatch.StartNew();
+                FeedBench(decoder, bytes, chunkBytes);
+                sw.Stop();
+                elapsedMs[i] = sw.Elapsed.TotalMilliseconds;
+                allocBytes[i] = GC.GetAllocatedBytesForCurrentThread() - allocBefore;
+            }
+
+            Array.Sort(elapsedMs);
+            Array.Sort(allocBytes);
+
+            double minMs = elapsedMs[0];
+            double medMs = Median(elapsedMs);
+            double maxMs = elapsedMs[elapsedMs.Length - 1];
+
+            Console.WriteLine("benchmark: " + input);
+            Console.WriteLine("  input      : " + inputMB.ToString("0.00") + " MiB, " +
+                              audioSeconds.ToString("0.00") + " s audio (" + hz + " Hz, " + ch + " ch)");
+            Console.WriteLine("  mode       : " + (chunkBytes > 0 ? "chunked " + chunkBytes + " B" : "whole file"));
+            Console.WriteLine("  passes     : " + iterations);
+            Console.WriteLine("  time       : min " + minMs.ToString("0.0") + " ms | median " +
+                              medMs.ToString("0.0") + " ms | max " + maxMs.ToString("0.0") + " ms");
+            Console.WriteLine("  throughput : " + (inputMB / (medMs / 1000.0)).ToString("0.00") + " MiB/s (median)");
+            Console.WriteLine("  real-time  : x" + (audioSeconds / (medMs / 1000.0)).ToString("0.0") + " (median)");
+            Console.WriteLine("  alloc/pass : min " + allocBytes[0] + " B | median " + Median(allocBytes) +
+                              " B | max " + allocBytes[allocBytes.Length - 1] + " B");
+
+            return 0;
+        }
+
+        private static void FeedBench(Mp3Decoder decoder, byte[] bytes, int chunkBytes)
+        {
+            if (chunkBytes <= 0)
+            {
+                decoder.Feed(bytes, 0, bytes.Length);
+                return;
+            }
+
+            int pos = 0;
+            while (pos < bytes.Length)
+            {
+                int n = Math.Min(chunkBytes, bytes.Length - pos);
+                decoder.Feed(bytes, pos, n);
+                pos += n;
+            }
+        }
+
+        private static double Median(double[] xs)
+        {
+            int n = xs.Length;
+            return n % 2 == 0 ? (xs[n / 2 - 1] + xs[n / 2]) / 2.0 : xs[n / 2];
+        }
+
+        private static long Median(long[] xs)
+        {
+            int n = xs.Length;
+            return n % 2 == 0 ? (xs[n / 2 - 1] + xs[n / 2]) / 2 : xs[n / 2];
         }
     }
 }

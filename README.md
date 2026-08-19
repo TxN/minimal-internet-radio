@@ -94,6 +94,9 @@ dotnet run --project tests\InternetRadio.Tests -c Release -- decode in.mp3 out.p
 # регресс-тест потокового пути декодера (порциями N байт; результат обязан совпадать с decode):
 dotnet run --project tests\InternetRadio.Tests -c Release -- chunk in.mp3 out.pcm 8192
 
+# бенчмарк декодера на реальном MP3 (пропускная способность, realtime-фактор, аллокации):
+dotnet run --project tests\InternetRadio.Tests -c Release -- bench in.mp3 5 8192
+
 # живой поток (url, секунды, вывод WAV):
 dotnet run --project tests\InternetRadio.Tests -c Release -- live http://host:8000/stream 10 out.wav
 

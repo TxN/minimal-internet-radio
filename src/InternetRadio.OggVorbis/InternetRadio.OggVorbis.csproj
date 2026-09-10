@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <RootNamespace>InternetRadio.OggVorbis</RootNamespace>
+    <AssemblyName>InternetRadio.OggVorbis</AssemblyName>
+    <Description>Ogg Vorbis decoder plugin for InternetRadio: wraps the public-domain stb_vorbis port (vendored, see StbVorbis/README.md).</Description>
+    <!-- The vendored stb_vorbis port works with pointers; it stays fully managed (no native
+         dependencies). Only this optional plugin assembly needs the switch, not the core. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <SignAssembly>false</SignAssembly>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\InternetRadio\InternetRadio.csproj" />
+  </ItemGroup>
+
+</Project>

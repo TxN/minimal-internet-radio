@@ -123,6 +123,15 @@ namespace InternetRadio
         /// <summary>Raised on connection/decoding errors (may fire repeatedly while reconnecting).</summary>
         public event Action<Exception> Error;
 
+        /// <summary>
+        /// Raised when the decoder reports container tags (for Ogg Vorbis — the Vorbis comment;
+        /// for Icecast Ogg streams it is usually only <c>encoder=</c>). Raised on a background thread.
+        /// </summary>
+        public event Action<AudioTags> TagsChanged;
+
+        /// <summary>Last tags reported by the decoder, or an empty value when there were none.</summary>
+        public AudioTags Tags { get; private set; }
+
         public void SetUrl(string url)
         {
             if (string.IsNullOrWhiteSpace(url))
@@ -335,6 +344,7 @@ namespace InternetRadio
 
                         if (initialized)
                         {
+                            DetachTagSource(decoder);
                             decoder.Dispose();
                             decoder = null;
                             initialized = false;
@@ -373,6 +383,7 @@ namespace InternetRadio
 
                         decoder = factory.Create();
                         decoder.PcmDecoded += DecoderFrameDecoded;
+                        AttachTagSource(decoder);
 
                         // A declared media type wins, but in-band ICY framing must only be
                         // stripped from codecs that actually use it: for a container format
@@ -396,8 +407,58 @@ namespace InternetRadio
             }
             finally
             {
+                DetachTagSource(decoder);
                 decoder?.Dispose();
                 SetState(_failed ? PlaybackState.Faulted : PlaybackState.Idle);
+            }
+        }
+
+        /// <summary>
+        /// Decoders that can report container tags (Vorbis comment, ID3, …) are subscribed to
+        /// while they are in use; the empty <see cref="StationInfo"/> fields are filled from
+        /// what they report, because for a container stream the response headers often carry
+        /// less than the container itself.
+        /// </summary>
+        private void AttachTagSource(IAudioDecoder decoder)
+        {
+            var source = decoder as IAudioTagSource;
+            if (source == null)
+                return;
+
+            source.TagsChanged += TagsAvailable;
+        }
+
+        private void DetachTagSource(IAudioDecoder decoder)
+        {
+            var source = decoder as IAudioTagSource;
+            if (source == null)
+                return;
+
+            source.TagsChanged -= TagsAvailable;
+        }
+
+        private void TagsAvailable(AudioTags tags)
+        {
+            if (tags.IsEmpty)
+                return;
+
+            StationInfo station = _station;
+            if (station != null)
+            {
+                if (string.IsNullOrEmpty(station.Name) && !string.IsNullOrEmpty(tags.Title))
+                    station.Name = tags.Title;
+                if (string.IsNullOrEmpty(station.Genre) && !string.IsNullOrEmpty(tags.Genre))
+                    station.Genre = tags.Genre;
+            }
+
+            Tags = tags;
+            try
+            {
+                TagsChanged?.Invoke(tags);
+            }
+            catch (Exception ex)
+            {
+                RaiseError(ex);
             }
         }
 
@@ -409,8 +470,13 @@ namespace InternetRadio
         private void DecoderFrameDecoded(PcmFrame frame)
         {
             StationInfo station = _station;
-            if (station != null && station.SampleRate == 0 && frame.SampleRate > 0)
-                station.SampleRate = frame.SampleRate;
+            if (station != null)
+            {
+                if (station.SampleRate == 0 && frame.SampleRate > 0)
+                    station.SampleRate = frame.SampleRate;
+                if (station.Channels == 0 && frame.Channels > 0)
+                    station.Channels = frame.Channels;
+            }
 
             try
             {

@@ -11,6 +11,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\InternetRadio\InternetRadio.csproj" />
+    <ProjectReference Include="..\..\src\InternetRadio.OggVorbis\InternetRadio.OggVorbis.csproj" />
   </ItemGroup>
 
 </Project>

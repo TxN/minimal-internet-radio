@@ -15,8 +15,14 @@ namespace InternetRadio
         /// <summary>Declared bitrate in kbps (icy-br), or 0 if unknown.</summary>
         public int BitrateKbps { get; set; }
 
-        /// <summary>Declared sample rate in Hz (icy-sr), or 0 if unknown.</summary>
+        /// <summary>Declared sample rate in Hz (icy-sr, or ice-audio-info samplerate), or 0 if unknown.</summary>
         public int SampleRate { get; set; }
+
+        /// <summary>Declared channel count (ice-audio-info channels), or 0 if unknown.</summary>
+        public int Channels { get; set; }
+
+        /// <summary>Station description (icy-description), when present.</summary>
+        public string Description { get; set; }
 
         /// <summary>Media type of the stream (Content-Type).</summary>
         public string ContentType { get; set; }

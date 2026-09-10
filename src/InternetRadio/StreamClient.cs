@@ -190,15 +190,64 @@ namespace InternetRadio
 
         private void ApplyHeader(string name, string value)
         {
+            // Icecast sends "(null)" for metadata the source did not set; treat it as absent.
+            if (string.Equals(value, "(null)", StringComparison.OrdinalIgnoreCase))
+                return;
+
             switch (name.ToLowerInvariant())
             {
-                case "icy-name": Station.Name = value; break;
-                case "icy-genre": Station.Genre = value; break;
-                case "icy-url": Station.Url = value; break;
-                case "icy-br": if (int.TryParse(value, out int br)) Station.BitrateKbps = br; break;
+                // Icecast 2.x uses icy-*; some servers/versions send the same fields as ice-*.
+                case "icy-name":
+                case "ice-name": Station.Name = value; break;
+                case "icy-genre":
+                case "ice-genre": Station.Genre = value; break;
+                case "icy-url":
+                case "ice-url": Station.Url = value; break;
+                case "icy-description":
+                case "ice-description": Station.Description = value; break;
+                case "icy-br":
+                case "ice-bitrate": if (int.TryParse(value, out int br)) Station.BitrateKbps = br; break;
                 case "icy-sr": if (int.TryParse(value, out int sr)) Station.SampleRate = sr; break;
                 case "content-type": Station.ContentType = value; break;
                 case "icy-metaint": if (int.TryParse(value, out int mi)) Station.MetadataInterval = mi; break;
+                case "ice-audio-info": ApplyAudioInfo(value); break;
+            }
+        }
+
+        /// <summary>
+        /// Parses <c>ice-audio-info</c>, the source-declared stream parameters that Icecast
+        /// reports as <c>key=value;key=value</c> (for example
+        /// <c>bitrate=128</c> or <c>samplerate=44100;channels=2;quality=3.00</c>). Ogg streams
+        /// usually carry no <c>icy-sr</c>, so this is where their format comes from.
+        /// </summary>
+        private void ApplyAudioInfo(string value)
+        {
+            foreach (string part in value.Split(';'))
+            {
+                int eq = part.IndexOf('=');
+                if (eq <= 0)
+                    continue;
+
+                string key = part.Substring(0, eq).Trim();
+                string raw = part.Substring(eq + 1).Trim();
+                if (raw.Length == 0)
+                    continue;
+
+                if (key.Equals("bitrate", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (int.TryParse(raw, out int br))
+                        Station.BitrateKbps = br;
+                }
+                else if (key.Equals("samplerate", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (int.TryParse(raw, out int sr))
+                        Station.SampleRate = sr;
+                }
+                else if (key.Equals("channels", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (int.TryParse(raw, out int ch))
+                        Station.Channels = ch;
+                }
             }
         }
 

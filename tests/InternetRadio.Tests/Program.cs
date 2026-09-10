@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using InternetRadio;
+using InternetRadio.OggVorbis;
 
 namespace InternetRadio.Tests
 {
@@ -19,20 +20,56 @@ namespace InternetRadio.Tests
         private const int SniffBytes = 1024;
 
         /// <summary>
-        /// Registry used by the file-based commands. Codec-agnostic: an extra factory
-        /// registered here makes every command work for that codec too.
+        /// Registry used by the file-based commands: built-in codecs plus the Ogg Vorbis
+        /// plugin. Codec-agnostic: an extra factory registered here makes every command
+        /// work for that codec too.
         /// </summary>
-        private static readonly AudioDecoderRegistry Registry = AudioDecoderRegistry.CreateDefault();
+        private static readonly AudioDecoderRegistry Registry = CreateHarnessRegistry();
+
+        private static AudioDecoderRegistry CreateHarnessRegistry()
+        {
+            var registry = AudioDecoderRegistry.CreateDefault();
+            registry.Register(new OggVorbisDecoderFactory());
+            return registry;
+        }
+
+        /// <summary>
+        /// Creates a player with the harness codec set applied. The library ships MP3 only,
+        /// so every command that builds an <see cref="InternetRadio"/> has to opt into the
+        /// plugins the same way a consumer would.
+        /// </summary>
+        private static InternetRadio CreateRadio()
+        {
+            var radio = new InternetRadio();
+            radio.Decoders.Register(new OggVorbisDecoderFactory());
+            return radio;
+        }
 
         private static int Main(string[] args)
+        {
+            try
+            {
+                return Run(args);
+            }
+            catch (NotImplementedException ex)
+            {
+                // A plugin that is still being written reports itself instead of dumping a stack.
+                Console.WriteLine("ERROR: " + ex.Message);
+                return 1;
+            }
+        }
+
+        private static int Run(string[] args)
         {
             if (args.Length < 1)
             {
                 Console.WriteLine("usage:");
                 Console.WriteLine("  decode   <input> <output.pcm>");
                 Console.WriteLine("  chunk    <input> <output.pcm> <chunkBytes>");
+                Console.WriteLine("  file     <input> <output.pcm> [readBufferBytes]  (public AudioFileDecoder API)");
                 Console.WriteLine("  pipe     <input> <output.pcm> [readChunkBytes]  (file through the streaming pipeline)");
                 Console.WriteLine("  registry                                        (offline plugin/registry checks)");
+                Console.WriteLine("  resync   <input> <output.pcm> [garbageBytes]     (decode with leading garbage, must ignore it)");
                 Console.WriteLine("  live     <url> <seconds> <output.wav>");
                 Console.WriteLine("  play     <url> <seconds>            (Windows-only, live playback)");
                 Console.WriteLine("  wavplay  <file.wav> [seconds]       (Windows-only, play a local WAV)");
@@ -47,10 +84,14 @@ namespace InternetRadio.Tests
                     return DecodeFile(args[1], args[2]);
                 case "chunk":
                     return DecodeFileChunked(args[1], args[2], int.Parse(args[3]));
+                case "file":
+                    return FileDecode(args[1], args[2], args.Length > 3 ? int.Parse(args[3]) : 64 * 1024);
                 case "pipe":
                     return PipeFile(args[1], args[2], args.Length > 3 ? int.Parse(args[3]) : 16 * 1024);
                 case "registry":
                     return RegistryChecks();
+                case "resync":
+                    return Resync(args[1], args[2], args.Length > 3 ? int.Parse(args[3]) : 4096);
                 case "live":
                     return Live(args[1], int.Parse(args[2]), args[3]);
                 case "play":
@@ -69,30 +110,12 @@ namespace InternetRadio.Tests
             }
         }
 
-        /// <summary>
-        /// Content-Type hint for a local file, mirroring what a streaming server sends in
-        /// its response headers: a command line has no headers of its own. Signature
-        /// detection alone cannot see past a leading ID3v2 tag larger than the sniff window.
-        /// </summary>
-        private static string ContentTypeHint(string path)
-        {
-            switch (Path.GetExtension(path).ToLowerInvariant())
-            {
-                case ".mp3": return "audio/mpeg";
-                case ".ogg":
-                case ".oga":
-                case ".opus": return "application/ogg";
-                case ".aac": return "audio/aac";
-                default: return null;
-            }
-        }
-
         /// <summary>Creates a decoder for a file, or reports why none matched.</summary>
         private static IAudioDecoder CreateFileDecoder(string path, byte[] bytes)
         {
             try
             {
-                return Registry.Create(ContentTypeHint(path), bytes, Math.Min(bytes.Length, SniffBytes));
+                return Registry.Create(AudioContentType.FromPath(path), bytes, Math.Min(bytes.Length, SniffBytes));
             }
             catch (NotSupportedException ex)
             {
@@ -101,6 +124,11 @@ namespace InternetRadio.Tests
             }
         }
 
+        /// <summary>
+        /// Decodes a whole file. The bytes are fed in bounded chunks rather than in one call, so
+        /// the decoder does not shift its whole input tail per frame (the streaming path, which
+        /// is what the player uses).
+        /// </summary>
         private static int DecodeFile(string input, string output)
         {
             byte[] bytes = File.ReadAllBytes(input);
@@ -122,11 +150,87 @@ namespace InternetRadio.Tests
                     fs.Write(pcm, 0, pcm.Length);
                     totalSamples += f.Samples.Length;
                 };
-                decoder.Feed(bytes, 0, bytes.Length);
+
+                const int chunkSize = 64 * 1024;
+                int pos = 0;
+                while (pos < bytes.Length)
+                {
+                    int n = Math.Min(chunkSize, bytes.Length - pos);
+                    decoder.Feed(bytes, pos, n);
+                    pos += n;
+                }
             }
 
             Console.WriteLine($"decoded {totalSamples} interleaved samples, {hz} Hz, {ch} ch");
             return 0;
+        }
+
+        /// <summary>
+        /// Decodes a file through the public <see cref="AudioFileDecoder"/> API: streaming with a
+        /// bounded read buffer, plus the completion notification. Output must be byte-identical to
+        /// <c>decode</c>. With <paramref name="readBufferBytes"/> &lt;= 0 the synchronous
+        /// <see cref="AudioFileDecoder.DecodeAll(string, AudioDecoderRegistry, Action{PcmFrame})"/>
+        /// overload is used instead.
+        /// </summary>
+        private static int FileDecode(string input, string output, int readBufferBytes)
+        {
+            int totalSamples = 0, hz = 0, ch = 0;
+            long returned = -1;
+            bool completed = false, failed = false;
+
+            using (var fs = new FileStream(output, FileMode.Create, FileAccess.Write))
+            {
+                Action<PcmFrame> onFrame = f =>
+                {
+                    hz = f.SampleRate;
+                    ch = f.Channels;
+                    byte[] pcm = new byte[f.Samples.Length * 2];
+                    Buffer.BlockCopy(f.Samples, 0, pcm, 0, pcm.Length);
+                    fs.Write(pcm, 0, pcm.Length);
+                    totalSamples += f.Samples.Length;
+                };
+
+                if (readBufferBytes <= 0)
+                {
+                    // Synchronous API: returns after the whole source has been decoded.
+                    returned = AudioFileDecoder.DecodeAll(input, Registry, onFrame, PrintTags);
+                    completed = true;
+                }
+                else
+                {
+                    var finished = new ManualResetEventSlim(false);
+                    using (var decoder = new AudioFileDecoder(Registry))
+                    {
+                        decoder.ReadBufferBytes = readBufferBytes;
+                        decoder.SetSource(input);
+                        decoder.PcmDecoded += onFrame;
+                        decoder.TagsChanged += PrintTags;
+                        decoder.Error += e =>
+                        {
+                            failed = true;
+                            Console.WriteLine("ERROR: " + e.GetType().Name + ": " + e.Message);
+                            finished.Set();
+                        };
+                        decoder.Completed += () =>
+                        {
+                            completed = true;
+                            finished.Set();
+                        };
+
+                        decoder.Start();
+                        finished.Wait(TimeSpan.FromMinutes(10));
+                    }
+                }
+            }
+
+            Console.WriteLine($"file(read {readBufferBytes} B): decoded {totalSamples} interleaved samples, " +
+                              $"{hz} Hz, {ch} ch, completed={completed}, returned={returned}");
+            return failed || !completed || (returned >= 0 && returned != totalSamples) ? 1 : 0;
+        }
+
+        private static void PrintTags(AudioTags t)
+        {
+            Console.WriteLine($"TAGS: title='{t.Title}' artist='{t.Artist}' album='{t.Album}' genre='{t.Genre}'");
         }
 
         /// <summary>Decodes an audio file feeding the decoder in small chunks, to verify the
@@ -183,7 +287,7 @@ namespace InternetRadio.Tests
 
             using (var stream = new FileStreamPlayer(input, ringCapacityBytes: 1024 * 1024,
                        prebufferBytes: prebufferBytes, readChunkBytes: readChunkBytes, registry: Registry,
-                       contentTypeHint: ContentTypeHint(input)))
+                       contentTypeHint: AudioContentType.FromPath(input)))
             using (var fs = new FileStream(output, FileMode.Create, FileAccess.Write))
             {
                 stream.PcmDecoded += f =>
@@ -288,16 +392,89 @@ namespace InternetRadio.Tests
             IAudioDecoder created = registry.Create(null, oggMagic, oggMagic.Length);
             Check("registry creates the plugin's decoder", created is StubDecoder);
 
+            // The harness registry additionally carries the real Ogg Vorbis plugin, so its
+            // detection contract is checked here without needing an audio file.
+            byte[] vorbisPage = BuildOggPage(new byte[] { 0x01, (byte)'v', (byte)'o', (byte)'r', (byte)'b', (byte)'i', (byte)'s' });
+            byte[] opusPage = BuildOggPage(System.Text.Encoding.ASCII.GetBytes("OpusHead"));
+
+            Check("ogg-vorbis claims audio/vorbis by Content-Type",
+                Registry.Resolve("audio/vorbis", null, 0)?.Name == "ogg-vorbis");
+            Check("ogg-vorbis claims a Vorbis stream by signature",
+                Registry.Resolve(null, vorbisPage, vorbisPage.Length)?.Name == "ogg-vorbis");
+            Check("ogg-vorbis does not claim an Opus stream in an Ogg container",
+                Registry.Resolve("application/ogg", opusPage, opusPage.Length) == null);
+            Check("ogg-vorbis declares no in-band ICY metadata",
+                Registry.Resolve(null, vorbisPage, vorbisPage.Length)?.UsesIcyMetadata == false);
+            Check("mp3 is still resolved for MPEG streams with the plugin registered",
+                Registry.Resolve("audio/mpeg", mp3Magic, mp3Magic.Length)?.Name == "mp3");
+
             Console.WriteLine(failures == 0 ? "registry: all checks passed" : "registry: " + failures + " check(s) FAILED");
             return failures == 0 ? 0 : 1;
         }
 
+        /// <summary>
+        /// Decodes a file with random garbage prepended. The decoder must resynchronise on the
+        /// first Ogg capture pattern and produce exactly the same PCM as the clean file — the
+        /// behaviour a radio stream needs after a mid-stream break or a wrong-content payload.
+        /// </summary>
+        private static int Resync(string input, string output, int garbageBytes)
+        {
+            byte[] clean = File.ReadAllBytes(input);
+            var garbage = new byte[garbageBytes];
+            new Random(20260910).NextBytes(garbage);
+
+            byte[] bytes = new byte[garbage.Length + clean.Length];
+            Buffer.BlockCopy(garbage, 0, bytes, 0, garbage.Length);
+            Buffer.BlockCopy(clean, 0, bytes, garbage.Length, clean.Length);
+
+            // A Content-Type hint cannot decide here, so the decoder is created directly: this
+            // check is about the decoder's resync, not about codec detection.
+            IAudioDecoder decoder = new OggVorbisDecoderFactory().Create();
+            int totalSamples = 0, hz = 0, ch = 0;
+
+            using (decoder)
+            using (var fs = new FileStream(output, FileMode.Create, FileAccess.Write))
+            {
+                decoder.PcmDecoded += f =>
+                {
+                    hz = f.SampleRate;
+                    ch = f.Channels;
+                    byte[] pcm = new byte[f.Samples.Length * 2];
+                    Buffer.BlockCopy(f.Samples, 0, pcm, 0, pcm.Length);
+                    fs.Write(pcm, 0, pcm.Length);
+                    totalSamples += f.Samples.Length;
+                };
+
+                decoder.Feed(bytes, 0, bytes.Length);
+            }
+
+            Console.WriteLine($"resync({garbageBytes} B garbage): decoded {totalSamples} interleaved samples, {hz} Hz, {ch} ch");
+            return 0;
+        }
+
+        /// <summary>
+        /// Builds a synthetic Ogg page (header + one-segment table) whose single packet is
+        /// the given identification header, for codec-detection checks.
+        /// </summary>
+        private static byte[] BuildOggPage(byte[] idPacket)
+        {
+            var page = new byte[27 + 1 + idPacket.Length];
+            page[0] = (byte)'O';
+            page[1] = (byte)'g';
+            page[2] = (byte)'g';
+            page[3] = (byte)'S';
+            page[4] = 0;      // stream structure version
+            page[5] = 0x02;   // beginning of stream
+            page[26] = 1;     // page_segments
+            page[27] = (byte)idPacket.Length;
+            Array.Copy(idPacket, 0, page, 28, idPacket.Length);
+            return page;
+        }
+
         private static int Live(string url, int seconds, string output)
         {
-            var radio = new InternetRadio
-            {
-                PrebufferBytes = 64 * 1024,
-            };
+            var radio = CreateRadio();
+            radio.PrebufferBytes = 64 * 1024;
             radio.SetUrl(url);
 
             int hz = 0, ch = 0;
@@ -314,12 +491,20 @@ namespace InternetRadio.Tests
                 radio.StreamTitleChanged += t => Console.WriteLine("TITLE: " + t);
                 radio.StateChanged += s => Console.WriteLine("STATE: " + s);
                 radio.Error += e => Console.WriteLine("ERROR: " + e.GetType().Name + ": " + e.Message);
+                radio.TagsChanged += t => Console.WriteLine(
+                    $"TAGS: title='{t.Title}' artist='{t.Artist}' album='{t.Album}' genre='{t.Genre}'");
 
                 radio.Start();
                 Thread.Sleep(seconds * 1000);
                 radio.Stop();
 
                 Console.WriteLine($"streamed {ms.Length / 2} interleaved samples, {hz} Hz, {ch} ch");
+                StationInfo station = radio.Station;
+                if (station != null)
+                {
+                    Console.WriteLine($"station: name='{station.Name}' genre='{station.Genre}' " +
+                                      $"ch={station.Channels} sr={station.SampleRate} br={station.BitrateKbps}");
+                }
                 WriteWav(output, ms.ToArray(), hz, ch);
             }
 
@@ -336,12 +521,10 @@ namespace InternetRadio.Tests
 
             // Moderate prebuffer: more than the minimal startup, without a long wait.
             int prebufferBytes = 128 * 1024; // ~8 s of audio at 128 kbps
-            var radio = new InternetRadio
-            {
-                PrebufferBytes = prebufferBytes,
-                RingCapacityBytes = 1024 * 1024,
-                SocketReceiveBufferBytes = 1024 * 1024,
-            };
+            var radio = CreateRadio();
+            radio.PrebufferBytes = prebufferBytes;
+            radio.RingCapacityBytes = 1024 * 1024;
+            radio.SocketReceiveBufferBytes = 1024 * 1024;
             radio.SetUrl(url);
 
             var player = new WaveOutPlayer();
@@ -571,7 +754,9 @@ namespace InternetRadio.Tests
             long fileLen = new FileInfo(path).Length;
             int prebufferBytes = (int)Math.Min(128 * 1024L, Math.Max(1L, fileLen));
 
-            var stream = new FileStreamPlayer(path, ringCapacityBytes: 1024 * 1024, prebufferBytes: prebufferBytes);
+            var stream = new FileStreamPlayer(path, ringCapacityBytes: 1024 * 1024,
+                prebufferBytes: prebufferBytes, registry: Registry,
+                contentTypeHint: AudioContentType.FromPath(path));
             var player = new WaveOutPlayer();
             bool opened = false;
             long firstFrameAt = 0;

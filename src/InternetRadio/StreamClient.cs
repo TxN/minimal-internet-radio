@@ -96,7 +96,18 @@ namespace InternetRadio
                 client._stream.Write(req, 0, req.Length);
                 client._stream.Flush();
 
-                client.ReadHeaders();
+                try
+                {
+                    client.ReadHeaders();
+                }
+                catch (IOException ex)
+                {
+                    // A redirect chain hides where the failure really happened: report the
+                    // URL that failed and how many hops away it is from the requested one
+                    // (a 404 on the last hop otherwise looks like the original URL is dead).
+                    client.Dispose();
+                    throw new IOException(DescribeFailure(ex.Message, url, currentUrl, hop), ex);
+                }
 
                 if (client.StatusCode >= 300 && client.StatusCode < 400 &&
                     client._headers.TryGetValue("Location", out string location))
@@ -110,6 +121,14 @@ namespace InternetRadio
             }
 
             throw new IOException("Too many redirects while connecting to " + url + ".");
+        }
+
+        private static string DescribeFailure(string message, string requestedUrl, string failedUrl, int hop)
+        {
+            if (hop <= 0)
+                return message + " [" + failedUrl + "]";
+
+            return message + " [" + failedUrl + ", after " + hop + " redirect(s) from " + requestedUrl + "]";
         }
 
         private static string ResolveUrl(string baseUrl, string location)

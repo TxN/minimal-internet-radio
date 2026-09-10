@@ -6,17 +6,25 @@ using InternetRadio;
 namespace InternetRadio.Tests
 {
     /// <summary>
-    /// Streams a local MP3 file through the same audio pipeline used for live radio
-    /// (file reader -> ring buffer -> prebuffer -> MP3 decoder), so the buffering and
-    /// playback path can be exercised without a network connection or ICY metadata.
+    /// Streams a local audio file through the same audio pipeline used for live radio
+    /// (file reader -> ring buffer -> prebuffer -> registered decoder), so the buffering
+    /// and playback path can be exercised without a network connection or ICY metadata.
+    /// The codec is resolved through <see cref="AudioDecoderRegistry"/>, so the file may
+    /// be anything the registry can decode (MP3 by default).
     /// PCM is delivered through <see cref="PcmDecoded"/> (typically to WaveOutPlayer).
     /// </summary>
     internal sealed class FileStreamPlayer : IDisposable
     {
+        /// <summary>Leading bytes used for codec detection (covers container headers and a
+        /// leading ID3v2 tag of a typical size).</summary>
+        private const int SniffBytes = 1024;
+
         private readonly string _path;
         private readonly int _ringCapacityBytes;
         private readonly int _prebufferBytes;
         private readonly int _readChunkBytes;
+        private readonly AudioDecoderRegistry _registry;
+        private readonly string _contentTypeHint;
 
         private RingBuffer _ring;
         private Thread _readerThread;
@@ -35,12 +43,15 @@ namespace InternetRadio.Tests
         public event Action<PlaybackState> StateChanged;
 
         public FileStreamPlayer(string path, int ringCapacityBytes = 1024 * 1024,
-            int prebufferBytes = 128 * 1024, int readChunkBytes = 16 * 1024)
+            int prebufferBytes = 128 * 1024, int readChunkBytes = 16 * 1024,
+            AudioDecoderRegistry registry = null, string contentTypeHint = null)
         {
             _path = path;
             _ringCapacityBytes = ringCapacityBytes;
             _prebufferBytes = prebufferBytes;
             _readChunkBytes = readChunkBytes;
+            _registry = registry ?? AudioDecoderRegistry.CreateDefault();
+            _contentTypeHint = contentTypeHint;
         }
 
         public PlaybackState State => (PlaybackState)_state;
@@ -121,18 +132,39 @@ namespace InternetRadio.Tests
 
         private void DecoderLoop()
         {
-            var decoder = new Mp3Decoder();
-            var prebuf = new MemoryStream();
+            IAudioDecoder decoder = null;
+            MemoryStream prebuf = new MemoryStream();
             bool prebuffered = false;
             bool failed = false;
+            byte[] sniff = new byte[SniffBytes];
+            int sniffCount = 0;
             byte[] chunk = new byte[8192];
 
-            decoder.PcmDecoded += frame =>
+            // Feeds clean audio into the prebuffer/decoder stage. Called with the sniffed
+            // prefix first and then with every following chunk, so byte order is preserved.
+            void Pump(byte[] data, int offset, int count)
             {
-                Interlocked.Increment(ref _frames);
-                try { PcmDecoded?.Invoke(frame); }
-                catch (Exception ex) { Error?.Invoke(ex); }
-            };
+                if (decoder == null || count <= 0)
+                    return;
+
+                if (!prebuffered)
+                {
+                    prebuf.Write(data, offset, count);
+                    if (prebuf.Length >= _prebufferBytes)
+                    {
+                        prebuffered = true;
+                        SetState(PlaybackState.Playing);
+                        byte[] buffered = prebuf.ToArray();
+                        prebuf.Dispose();
+                        prebuf = null;
+                        decoder.Feed(buffered, 0, buffered.Length);
+                    }
+                }
+                else
+                {
+                    decoder.Feed(data, offset, count);
+                }
+            }
 
             try
             {
@@ -146,23 +178,40 @@ namespace InternetRadio.Tests
                         continue;
                     }
 
-                    if (!prebuffered)
+                    if (decoder == null)
                     {
-                        prebuf.Write(chunk, 0, n);
-                        if (prebuf.Length >= _prebufferBytes)
+                        // Detection uses the caller's Content-Type hint (a local file has no
+                        // HTTP headers of its own) and falls back to the byte signature.
+                        int take = Math.Min(n, sniff.Length - sniffCount);
+                        Array.Copy(chunk, 0, sniff, sniffCount, take);
+                        sniffCount += take;
+
+                        IAudioDecoderFactory factory = _registry.Resolve(_contentTypeHint, sniff, sniffCount);
+                        if (factory == null)
                         {
-                            prebuffered = true;
-                            SetState(PlaybackState.Playing);
-                            byte[] buffered = prebuf.ToArray();
-                            prebuf.Dispose();
-                            prebuf = null;
-                            decoder.Feed(buffered, 0, buffered.Length);
+                            if (sniffCount >= sniff.Length)
+                                throw new NotSupportedException(
+                                    "No registered decoder accepts this file. Registered codecs: " + _registry.Names +
+                                    ". Content-Type hint: " + (string.IsNullOrEmpty(_contentTypeHint) ? "(none)" : _contentTypeHint) +
+                                    ", leading bytes: " + AudioDecoderRegistry.DescribeMagic(sniff, sniffCount) + ".");
+                            continue;
                         }
+
+                        decoder = factory.Create();
+                        decoder.PcmDecoded += frame =>
+                        {
+                            Interlocked.Increment(ref _frames);
+                            try { PcmDecoded?.Invoke(frame); }
+                            catch (Exception ex) { Error?.Invoke(ex); }
+                        };
+
+                        Pump(sniff, 0, sniffCount);
+                        if (take < n)
+                            Pump(chunk, take, n - take);
+                        continue;
                     }
-                    else
-                    {
-                        decoder.Feed(chunk, 0, n);
-                    }
+
+                    Pump(chunk, 0, n);
                 }
             }
             catch (Exception ex)
@@ -172,7 +221,7 @@ namespace InternetRadio.Tests
             }
             finally
             {
-                decoder.Dispose();
+                decoder?.Dispose();
                 SetState(failed ? PlaybackState.Faulted : PlaybackState.Idle);
                 _done = true;
             }

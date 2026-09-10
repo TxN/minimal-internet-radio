@@ -10,23 +10,34 @@ namespace InternetRadio.Tests
 {
     /// <summary>
     /// Test/validation harness.
-    ///   decode &lt;input.mp3&gt; &lt;output.pcm&gt;   — decode a pure MP3 file to raw 16-bit PCM.
+    ///   decode &lt;input&gt; &lt;output.pcm&gt;        — decode an audio file to raw 16-bit PCM.
     ///   live   &lt;url&gt; &lt;seconds&gt; &lt;output.wav&gt; — stream a station for N seconds to a WAV file.
     /// </summary>
     internal static class Program
     {
+        /// <summary>Leading bytes handed to codec detection (mirrors the pipelines).</summary>
+        private const int SniffBytes = 1024;
+
+        /// <summary>
+        /// Registry used by the file-based commands. Codec-agnostic: an extra factory
+        /// registered here makes every command work for that codec too.
+        /// </summary>
+        private static readonly AudioDecoderRegistry Registry = AudioDecoderRegistry.CreateDefault();
+
         private static int Main(string[] args)
         {
             if (args.Length < 1)
             {
                 Console.WriteLine("usage:");
-                Console.WriteLine("  decode  <input.mp3> <output.pcm>");
-                Console.WriteLine("  chunk   <input.mp3> <output.pcm> <chunkBytes>");
-                Console.WriteLine("  live    <url> <seconds> <output.wav>");
-                Console.WriteLine("  play    <url> <seconds>            (Windows-only, live playback)");
-                Console.WriteLine("  wavplay <file.wav> [seconds]       (Windows-only, play a local WAV)");
-                Console.WriteLine("  fileplay <file.mp3> [seconds]      (Windows-only, stream a local MP3 through the pipeline)");
-                Console.WriteLine("  bench   <input.mp3> [iterations] [chunkBytes]");
+                Console.WriteLine("  decode   <input> <output.pcm>");
+                Console.WriteLine("  chunk    <input> <output.pcm> <chunkBytes>");
+                Console.WriteLine("  pipe     <input> <output.pcm> [readChunkBytes]  (file through the streaming pipeline)");
+                Console.WriteLine("  registry                                        (offline plugin/registry checks)");
+                Console.WriteLine("  live     <url> <seconds> <output.wav>");
+                Console.WriteLine("  play     <url> <seconds>            (Windows-only, live playback)");
+                Console.WriteLine("  wavplay  <file.wav> [seconds]       (Windows-only, play a local WAV)");
+                Console.WriteLine("  fileplay <file> [seconds]           (Windows-only, stream a local file through the pipeline)");
+                Console.WriteLine("  bench    <input> [iterations] [chunkBytes]");
                 return 2;
             }
 
@@ -36,6 +47,10 @@ namespace InternetRadio.Tests
                     return DecodeFile(args[1], args[2]);
                 case "chunk":
                     return DecodeFileChunked(args[1], args[2], int.Parse(args[3]));
+                case "pipe":
+                    return PipeFile(args[1], args[2], args.Length > 3 ? int.Parse(args[3]) : 16 * 1024);
+                case "registry":
+                    return RegistryChecks();
                 case "live":
                     return Live(args[1], int.Parse(args[2]), args[3]);
                 case "play":
@@ -54,12 +69,48 @@ namespace InternetRadio.Tests
             }
         }
 
+        /// <summary>
+        /// Content-Type hint for a local file, mirroring what a streaming server sends in
+        /// its response headers: a command line has no headers of its own. Signature
+        /// detection alone cannot see past a leading ID3v2 tag larger than the sniff window.
+        /// </summary>
+        private static string ContentTypeHint(string path)
+        {
+            switch (Path.GetExtension(path).ToLowerInvariant())
+            {
+                case ".mp3": return "audio/mpeg";
+                case ".ogg":
+                case ".oga":
+                case ".opus": return "application/ogg";
+                case ".aac": return "audio/aac";
+                default: return null;
+            }
+        }
+
+        /// <summary>Creates a decoder for a file, or reports why none matched.</summary>
+        private static IAudioDecoder CreateFileDecoder(string path, byte[] bytes)
+        {
+            try
+            {
+                return Registry.Create(ContentTypeHint(path), bytes, Math.Min(bytes.Length, SniffBytes));
+            }
+            catch (NotSupportedException ex)
+            {
+                Console.WriteLine("ERROR: " + ex.Message);
+                return null;
+            }
+        }
+
         private static int DecodeFile(string input, string output)
         {
             byte[] bytes = File.ReadAllBytes(input);
-            var decoder = new Mp3Decoder();
+            IAudioDecoder decoder = CreateFileDecoder(input, bytes);
+            if (decoder == null)
+                return 2;
+
             int totalSamples = 0, hz = 0, ch = 0;
 
+            using (decoder)
             using (var fs = new FileStream(output, FileMode.Create, FileAccess.Write))
             {
                 decoder.PcmDecoded += f =>
@@ -78,14 +129,18 @@ namespace InternetRadio.Tests
             return 0;
         }
 
-        /// <summary>Decodes an MP3 file feeding the decoder in small chunks, to verify the
+        /// <summary>Decodes an audio file feeding the decoder in small chunks, to verify the
         /// streaming/resync path does not drop or duplicate frames regardless of chunking.</summary>
         private static int DecodeFileChunked(string input, string output, int chunkSize)
         {
             byte[] bytes = File.ReadAllBytes(input);
-            var decoder = new Mp3Decoder();
+            IAudioDecoder decoder = CreateFileDecoder(input, bytes);
+            if (decoder == null)
+                return 2;
+
             int totalSamples = 0, hz = 0, ch = 0;
 
+            using (decoder)
             using (var fs = new FileStream(output, FileMode.Create, FileAccess.Write))
             {
                 decoder.PcmDecoded += f =>
@@ -109,6 +164,132 @@ namespace InternetRadio.Tests
 
             Console.WriteLine($"chunked({chunkSize} B): decoded {totalSamples} interleaved samples, {hz} Hz, {ch} ch");
             return 0;
+        }
+
+        /// <summary>
+        /// Runs a local file through the full streaming pipeline (ring buffer -> prebuffer ->
+        /// registered decoder) with a real reader thread, and writes the PCM to disk. Output
+        /// must be byte-identical to <c>decode</c>: this covers the pipeline plumbing,
+        /// including codec detection and the replay of the sniffed prefix.
+        /// </summary>
+        private static int PipeFile(string input, string output, int readChunkBytes)
+        {
+            long fileLen = new FileInfo(input).Length;
+            int prebufferBytes = (int)Math.Min(128 * 1024L, Math.Max(1L, fileLen));
+
+            int hz = 0, ch = 0;
+            long samples = 0;
+            bool anyError = false;
+
+            using (var stream = new FileStreamPlayer(input, ringCapacityBytes: 1024 * 1024,
+                       prebufferBytes: prebufferBytes, readChunkBytes: readChunkBytes, registry: Registry,
+                       contentTypeHint: ContentTypeHint(input)))
+            using (var fs = new FileStream(output, FileMode.Create, FileAccess.Write))
+            {
+                stream.PcmDecoded += f =>
+                {
+                    hz = f.SampleRate;
+                    ch = f.Channels;
+                    byte[] pcm = new byte[f.Samples.Length * 2];
+                    Buffer.BlockCopy(f.Samples, 0, pcm, 0, pcm.Length);
+                    fs.Write(pcm, 0, pcm.Length);
+                    samples += f.Samples.Length;
+                };
+                stream.Error += e =>
+                {
+                    anyError = true;
+                    Console.WriteLine("ERROR: " + e.GetType().Name + ": " + e.Message);
+                };
+
+                stream.Start();
+                while (!stream.IsDone)
+                    Thread.Sleep(20);
+                stream.Stop();
+            }
+
+            Console.WriteLine($"piped (read {readChunkBytes} B): decoded {samples} interleaved samples, {hz} Hz, {ch} ch");
+            return anyError ? 1 : 0;
+        }
+
+        /// <summary>
+        /// Media-free checks of the pluggable decoder registry: detection precedence
+        /// (Content-Type before byte signature), registration order, duplicate handling,
+        /// the diagnostic for an unsupported stream, and that a registered plugin takes over
+        /// a codec the core does not know.
+        /// </summary>
+        private static int RegistryChecks()
+        {
+            const string oggContentType = "application/ogg";
+            byte[] oggMagic = { (byte)'O', (byte)'g', (byte)'g', (byte)'S', 0x00, 0x02 };
+            byte[] mp3Magic = { 0xFF, 0xFB, 0x90, 0x00 };
+
+            int failures = 0;
+            void Check(string what, bool ok)
+            {
+                Console.WriteLine((ok ? "  ok   " : "  FAIL ") + what);
+                if (!ok) failures++;
+            }
+
+            var registry = AudioDecoderRegistry.CreateDefault();
+            Check("default registry is mp3 only (" + registry.Names + ")", registry.Count == 1 && registry.Names == "mp3");
+            Check("Content-Type audio/mpeg resolves to mp3", registry.Resolve("audio/mpeg", null, 0)?.Name == "mp3");
+            Check("MPEG frame sync resolves to mp3", registry.Resolve(null, mp3Magic, mp3Magic.Length)?.Name == "mp3");
+            Check("Ogg stream is not claimed by mp3", registry.Resolve(oggContentType, oggMagic, oggMagic.Length) == null);
+
+            bool throws = false, mentionsCodecs = false;
+            try
+            {
+                registry.Create(oggContentType, oggMagic, oggMagic.Length);
+            }
+            catch (NotSupportedException ex)
+            {
+                throws = true;
+                mentionsCodecs = ex.Message.IndexOf("mp3", StringComparison.Ordinal) >= 0;
+            }
+            Check("unsupported stream throws and lists registered codecs", throws && mentionsCodecs);
+
+            bool duplicateThrows = false;
+            try
+            {
+                registry.Register(new StubDecoderFactory("mp3"));
+            }
+            catch (InvalidOperationException)
+            {
+                duplicateThrows = true;
+            }
+            Check("duplicate factory name throws", duplicateThrows);
+
+            var replacement = new StubDecoderFactory("mp3", contentMatch: "mpeg");
+            registry.Register(replacement, replaceExisting: true);
+            Check("replaceExisting swaps the factory in place",
+                registry.Count == 1 && ReferenceEquals(registry.Resolve("audio/mpeg", null, 0), replacement));
+            registry.Register(new Mp3DecoderFactory(), replaceExisting: true);
+
+            // Content-Type wins over a byte signature: a plugin registered last still wins
+            // when the header names its media type, even if the bytes look like MP3.
+            var lastPlugin = new StubDecoderFactory("late-plugin", contentMatch: "ogg", magic: mp3Magic);
+            registry.Register(lastPlugin);
+            Check("later plugin wins on Content-Type despite MP3-looking bytes",
+                ReferenceEquals(registry.Resolve(oggContentType, mp3Magic, mp3Magic.Length), lastPlugin));
+            Check("byte signature falls back to registration order",
+                registry.Resolve(null, mp3Magic, mp3Magic.Length)?.Name == "mp3");
+
+            Check("Unregister removes the plugin", registry.Unregister("late-plugin") && registry.Count == 1);
+
+            // A registered Ogg plugin takes over a codec the core does not implement.
+            var ogg = new StubDecoderFactory("ogg-vorbis", contentMatch: "ogg", magic: oggMagic, usesIcyMetadata: false);
+            registry.Register(ogg);
+            Check("Ogg resolves by Content-Type once the plugin is registered",
+                ReferenceEquals(registry.Resolve(oggContentType, null, 0), ogg));
+            Check("Ogg resolves by signature once the plugin is registered",
+                ReferenceEquals(registry.Resolve(null, oggMagic, oggMagic.Length), ogg));
+            Check("Ogg plugin declares no in-band ICY metadata", !ogg.UsesIcyMetadata);
+
+            IAudioDecoder created = registry.Create(null, oggMagic, oggMagic.Length);
+            Check("registry creates the plugin's decoder", created is StubDecoder);
+
+            Console.WriteLine(failures == 0 ? "registry: all checks passed" : "registry: " + failures + " check(s) FAILED");
+            return failures == 0 ? 0 : 1;
         }
 
         private static int Live(string url, int seconds, string output)
@@ -368,7 +549,7 @@ namespace InternetRadio.Tests
         }
 
         /// <summary>
-        /// Streams a local MP3 file through the buffering + decoding pipeline and plays
+        /// Streams a local audio file through the buffering + decoding pipeline and plays
         /// it via WaveOutPlayer. Unlike <c>play</c>, the source is a file on disk rather
         /// than a network station, so the streaming path is deterministic and offline.
         /// Pass 0 (or omit) seconds to play the whole file and then drain the device.
@@ -493,7 +674,7 @@ namespace InternetRadio.Tests
         private static int _benchCh;
 
         /// <summary>
-        /// Benchmarks the MP3 decoder on a real file. The file is read once; it is then
+        /// Benchmarks the registered decoder for a file. The file is read once; it is then
         /// decoded repeatedly (whole-file or in streaming-sized chunks) so timing covers
         /// only the decoder, not I/O. Reports throughput, real-time factor and managed
         /// allocations per pass.
@@ -503,7 +684,9 @@ namespace InternetRadio.Tests
             if (iterations <= 0) iterations = 5;
 
             byte[] bytes = File.ReadAllBytes(input);
-            var decoder = new Mp3Decoder();
+            IAudioDecoder decoder = CreateFileDecoder(input, bytes);
+            if (decoder == null)
+                return 2;
 
             // The handler references only static fields, so the compiler caches the
             // delegate: the benchmark itself does not allocate per decoded frame.
@@ -523,7 +706,8 @@ namespace InternetRadio.Tests
 
             if (samplesPerPass <= 0 || hz <= 0 || ch <= 0)
             {
-                Console.WriteLine("No PCM decoded; is this a valid Layer III MP3?");
+                Console.WriteLine("No PCM decoded; does this file match a registered codec? Registered: " + Registry.Names + ".");
+                decoder.Dispose();
                 return 2;
             }
 
@@ -564,10 +748,11 @@ namespace InternetRadio.Tests
             Console.WriteLine("  alloc/pass : min " + allocBytes[0] + " B | median " + Median(allocBytes) +
                               " B | max " + allocBytes[allocBytes.Length - 1] + " B");
 
+            decoder.Dispose();
             return 0;
         }
 
-        private static void FeedBench(Mp3Decoder decoder, byte[] bytes, int chunkBytes)
+        private static void FeedBench(IAudioDecoder decoder, byte[] bytes, int chunkBytes)
         {
             if (chunkBytes <= 0)
             {

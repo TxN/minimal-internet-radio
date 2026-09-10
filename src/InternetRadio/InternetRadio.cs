@@ -9,7 +9,8 @@ namespace InternetRadio
     /// Compact, dependency-free internet radio player.
     ///
     /// Pipeline: raw TCP/TLS stream reader -> thread-safe ring buffer ->
-    /// ICY metadata splitter -> prebuffer -> MP3 decoder -> PCM events.
+    /// ICY metadata splitter -> prebuffer -> registered decoder -> PCM events.
+    /// Decoders are pluggable through <see cref="Decoders"/>; MP3 is built in.
     ///
     /// Usage:
     ///   var radio = new InternetRadio();
@@ -20,11 +21,22 @@ namespace InternetRadio
     ///   ...
     ///   radio.Stop();
     ///
+    /// Additional codecs are opted into before Start, e.g.
+    ///   radio.Decoders.Register(new OggVorbisDecoderFactory());
+    ///
     /// All events are raised on background threads; marshal to the main/UI
     /// thread yourself if needed. No Unity or third-party dependencies.
     /// </summary>
     public sealed class InternetRadio : IDisposable
     {
+        /// <summary>
+        /// Leading stream bytes buffered for codec detection. Large enough to hold the
+        /// identification header of container formats (an Ogg page header plus the Vorbis
+        /// or Opus id packet) and to see past a leading ID3v2 tag of a typical size.
+        /// Bytes consumed here are replayed to the decoder, so detection costs no audio.
+        /// </summary>
+        private const int SniffBytes = 1024;
+
         private readonly object _sync = new object();
 
         private string _url;
@@ -32,7 +44,14 @@ namespace InternetRadio
         private Thread _readerThread;
         private Thread _decoderThread;
         private RingBuffer _ring;
-        private StationInfo _station;
+
+        // Published by the reader thread after every successful connect, read by the
+        // decoder thread: volatile keeps the swap visible without locking.
+        private volatile StationInfo _station;
+
+        // Incremented by the reader thread for every new connection so the decoder
+        // thread can tell a reconnect from a continuation of the same stream.
+        private int _connectionEpoch;
 
         // Caches the last in-band metadata block so the (rare) title message is only
         // decoded/parsed when the raw block actually changes.
@@ -80,6 +99,13 @@ namespace InternetRadio
 
         /// <summary>Station metadata, populated after a successful connection.</summary>
         public StationInfo Station => _station;
+
+        /// <summary>
+        /// Decoders available to this player, keyed by Content-Type and byte signature.
+        /// Contains MP3 by default: register an extra factory to support another codec
+        /// (for example Ogg Vorbis) before calling <see cref="Start"/>.
+        /// </summary>
+        public AudioDecoderRegistry Decoders { get; } = AudioDecoderRegistry.CreateDefault();
 
         /// <summary>
         /// Raised for each decoded chunk of interleaved 16-bit PCM. The frame's sample
@@ -197,6 +223,10 @@ namespace InternetRadio
                         client = StreamClient.Connect(_url, ConnectTimeoutMs, ReadTimeoutMs, SocketReceiveBufferBytes);
                         _station = client.Station;
 
+                        // Announce the new connection before any of its bytes reach the ring
+                        // buffer: the decoder thread uses this to drop the previous codec state.
+                        Interlocked.Increment(ref _connectionEpoch);
+
                         if (State == PlaybackState.Connecting)
                             SetState(PlaybackState.Buffering);
 
@@ -243,11 +273,12 @@ namespace InternetRadio
         private void DecoderLoop()
         {
             IcySplitter splitter = new IcySplitter();
-            Mp3Decoder decoder = null;
+            IAudioDecoder decoder = null;
             MemoryStream prebuf = new MemoryStream();
             bool prebuffered = false;
             bool initialized = false;
-            byte[] sniff = new byte[16];
+            int epochSeen = 0;
+            byte[] sniff = new byte[SniffBytes];
             int sniffCount = 0;
             byte[] chunk = new byte[8192];
 
@@ -294,41 +325,68 @@ namespace InternetRadio
                         continue;
                     }
 
-                    if (!initialized)
+                    // A reconnect starts a new bitstream: drop the previous decoder, the
+                    // sniffed prefix, the ICY framing and the prebuffer, so the new stream
+                    // is not decoded with mid-frame state left over from the old one.
+                    int epoch = Volatile.Read(ref _connectionEpoch);
+                    if (epoch != epochSeen)
                     {
-                        StreamCodec codec = CodecDetector.FromContentType(_station?.ContentType);
-                        if (codec == StreamCodec.Unknown)
+                        epochSeen = epoch;
+
+                        if (initialized)
                         {
-                            int take = Math.Min(n, sniff.Length - sniffCount);
-                            Array.Copy(chunk, 0, sniff, sniffCount, take);
-                            sniffCount += take;
-                            if (sniffCount >= 4)
-                                codec = CodecDetector.FromMagic(sniff);
+                            decoder.Dispose();
+                            decoder = null;
+                            initialized = false;
+                            SetState(PlaybackState.Buffering);
                         }
 
-                        if (codec == StreamCodec.Unknown)
-                        {
-                            if (sniffCount >= 16)
-                                throw new NotSupportedException("Unrecognized stream codec.");
-                        }
-                        else
-                        {
-                            if (codec != StreamCodec.Mp3)
-                                throw new NotSupportedException("Codec not supported: " + codec + ". Only MP3 (audio/mpeg) is decoded.");
-
-                            decoder = new Mp3Decoder();
-                            decoder.PcmDecoded += frame =>
-                            {
-                                try { PcmDecoded?.Invoke(frame); }
-                                catch (Exception ex) { RaiseError(ex); }
-                            };
-                            splitter.Reset(_station?.MetadataInterval ?? 0);
-                            initialized = true;
-                        }
+                        sniffCount = 0;
+                        prebuf?.Dispose();
+                        prebuf = new MemoryStream();
+                        prebuffered = false;
                     }
 
-                    if (initialized)
-                        splitter.Feed(chunk, 0, n);
+                    if (!initialized)
+                    {
+                        // Detection runs on the leading bytes of the connection. The bytes
+                        // consumed here are replayed to the splitter once a decoder is
+                        // chosen: they carry the codec headers.
+                        StationInfo station = _station;
+                        int take = Math.Min(n, sniff.Length - sniffCount);
+                        Array.Copy(chunk, 0, sniff, sniffCount, take);
+                        sniffCount += take;
+
+                        IAudioDecoderFactory factory = Decoders.Resolve(station?.ContentType, sniff, sniffCount);
+                        if (factory == null)
+                        {
+                            // Keep sniffing until the window is full; only then is the
+                            // codec genuinely unrecognized.
+                            if (sniffCount >= sniff.Length)
+                                throw new NotSupportedException(
+                                    "No registered decoder accepts this stream. Registered codecs: " + Decoders.Names +
+                                    ". Content-Type: " + (string.IsNullOrEmpty(station?.ContentType) ? "(none)" : station.ContentType) +
+                                    ", leading bytes: " + AudioDecoderRegistry.DescribeMagic(sniff, sniffCount) + ".");
+
+                            continue;
+                        }
+
+                        decoder = factory.Create();
+                        decoder.PcmDecoded += DecoderFrameDecoded;
+
+                        // A declared media type wins, but in-band ICY framing must only be
+                        // stripped from codecs that actually use it: for a container format
+                        // (Ogg) icy-metaint would cut bytes out of the middle of a page.
+                        splitter.Reset(factory.UsesIcyMetadata ? (station?.MetadataInterval ?? 0) : 0);
+                        initialized = true;
+
+                        splitter.Feed(sniff, 0, sniffCount);
+                        if (take < n)
+                            splitter.Feed(chunk, take, n - take);
+                        continue;
+                    }
+
+                    splitter.Feed(chunk, 0, n);
                 }
             }
             catch (Exception ex)
@@ -340,6 +398,27 @@ namespace InternetRadio
             {
                 decoder?.Dispose();
                 SetState(_failed ? PlaybackState.Faulted : PlaybackState.Idle);
+            }
+        }
+
+        /// <summary>
+        /// Forwards a decoded frame and publishes the stream format the decoder reported.
+        /// Container streams (Ogg) carry no <c>icy-sr</c> header, so without this
+        /// <see cref="Station"/> would report no sample rate for them.
+        /// </summary>
+        private void DecoderFrameDecoded(PcmFrame frame)
+        {
+            StationInfo station = _station;
+            if (station != null && station.SampleRate == 0 && frame.SampleRate > 0)
+                station.SampleRate = frame.SampleRate;
+
+            try
+            {
+                PcmDecoded?.Invoke(frame);
+            }
+            catch (Exception ex)
+            {
+                RaiseError(ex);
             }
         }
 
